@@ -136,14 +136,20 @@ gew = GeoEarthworm(
 
 `run_geoearthworm.py` wraps the library into a single command: point it at a
 borehole CSV (and optionally a DEM) and it writes bedrock-level GeoTIFF(s),
-an overburden GeoTIFF (if a DEM is given), and a summary PNG.
+an overburden GeoTIFF (if a DEM is given), and a summary PNG. Every raster is
+written with the CRS/transform derived from your data's own coordinates, so
+it opens correctly aligned in QGIS, ArcGIS, or any other GIS software.
 
 ```bash
-# Bedrock level only (no DEM)
+# Bedrock level only (no DEM), default IDW interpolation
 python run_geoearthworm.py --csv boreholes.csv
 
 # Bedrock level + overburden thickness
 python run_geoearthworm.py --csv boreholes.csv --dem dem.tif
+
+# Kriging or spline instead of IDW
+python run_geoearthworm.py --csv boreholes.csv --method kriging
+python run_geoearthworm.py --csv boreholes.csv --method spline
 ```
 
 By default it expects columns `longitude`, `latitude`, `bedrock_depth` and
@@ -151,9 +157,21 @@ treats the value column as depth below the surface. Use `--lon-col` /
 `--lat-col` / `--value-col` to match your own CSV, and `--values altitude`
 if your column holds bedrock elevation instead of depth.
 
+`--method` selects the interpolation algorithm:
+
+| Method | Flag value | Notes |
+|--------|-----------|-------|
+| Inverse Distance Weighting | `idw` (default) | Fast, predictable, bounded by the input value range. Tune with `--power`, `--max-neighbors`, `--max-distance`, `--smoothing`. |
+| Kriging | `kriging` | Uses the data's own spatial statistics (via [PyKrige](https://github.com/GeoStat-Framework/PyKrige)); can outperform IDW but needs enough points with real spatial correlation. Tune with `--variogram-model` (`spherical` default, or `gaussian`/`exponential`/`linear`/`power`). |
+| Spline | `spline` | Thin-plate-spline fit through (or near) every point; can overshoot beyond the input range. Tune with `--smoothing` and `--max-neighbors`. |
+
+If a method's output turns out nearly flat (no meaningful variation), the
+tool prints a warning — this usually means the data lacks the spatial
+structure that method needs, and IDW is a safer fallback.
+
 Run `python run_geoearthworm.py --help` for the full list of options
-(EPSG code, bounding box, resolution, IDW power, neighbor limits, output
-directory, etc.). Outputs default to `geoearthworm_output/`.
+(EPSG code, bounding box, resolution, neighbor limits, output directory,
+etc.). Outputs default to `geoearthworm_output/`.
 
 ---
 

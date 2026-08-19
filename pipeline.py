@@ -17,11 +17,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import rasterio as rio
 from rasterio.crs import CRS
+from rasterio.transform import from_bounds
 from rasterio.warp import reproject, Resampling
 
 from geo_earthworm import GeoEarthworm
 
 PathLike = Union[str, Path]
+
+METHOD_LABELS = {
+    "idw": "IDW",
+    "kriging": "Kriging",
+    "spline": "Spline",
+}
 
 
 @dataclass
@@ -29,6 +36,7 @@ class PipelineResult:
     output_dir: Path
     image_path: Path
     input_stats: dict
+    method: str
     bedrock_depth_path: Optional[Path] = None
     bedrock_altitude_path: Optional[Path] = None
     overburden_path: Optional[Path] = None
@@ -54,6 +62,78 @@ def _auto_resolution(bbox: Tuple[float, float, float, float], target_cells: int 
 
 def _mask_nodata(array: np.ndarray, nodata: float) -> np.ndarray:
     return np.where(array == nodata, np.nan, array)
+
+
+def _build_grid(bbox: Tuple[float, float, float, float], resolution: float):
+    """Build the output grid + its GeoTIFF affine transform from a bbox and resolution."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    cols = int(np.ceil((max_lon - min_lon) / resolution))
+    rows = int(np.ceil((max_lat - min_lat) / resolution))
+
+    x = np.linspace(min_lon, max_lon, cols)
+    y = np.linspace(max_lat, min_lat, rows)  # top to bottom, matches raster row order
+    grid_lon, grid_lat = np.meshgrid(x, y)
+
+    transform = from_bounds(min_lon, min_lat, max_lon, max_lat, cols, rows)
+    return grid_lon, grid_lat, transform
+
+
+def _interpolate_kriging(
+    lon: np.ndarray, lat: np.ndarray, values: np.ndarray,
+    grid_lon: np.ndarray, grid_lat: np.ndarray, variogram_model: str,
+) -> np.ndarray:
+    from pykrige.ok import OrdinaryKriging
+
+    ok = OrdinaryKriging(
+        lon, lat, values,
+        variogram_model=variogram_model,
+        verbose=False, enable_plotting=False,
+    )
+    x = grid_lon[0, :]
+    y = grid_lat[:, 0]
+    z, _ = ok.execute("grid", x, y)
+    return np.asarray(z, dtype=np.float64)
+
+
+def _interpolate_spline(
+    lon: np.ndarray, lat: np.ndarray, values: np.ndarray,
+    grid_lon: np.ndarray, grid_lat: np.ndarray,
+    smoothing: float, max_neighbors: Optional[int],
+) -> np.ndarray:
+    from scipy.interpolate import RBFInterpolator
+
+    points = np.column_stack([lon, lat])
+    rbf = RBFInterpolator(
+        points, values, kernel="thin_plate_spline",
+        smoothing=smoothing, neighbors=max_neighbors,
+    )
+    query_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
+    return rbf(query_points).reshape(grid_lon.shape)
+
+
+def _interpolate(
+    method: str,
+    interpolator: GeoEarthworm,
+    lon: np.ndarray, lat: np.ndarray, values: np.ndarray,
+    grid_lon: np.ndarray, grid_lat: np.ndarray,
+    *,
+    power: float,
+    max_neighbors: Optional[int],
+    max_distance: Optional[float],
+    smoothing: float,
+    variogram_model: str,
+) -> np.ndarray:
+    """Dispatch to the chosen interpolation method. Returns a grid with NaN for unresolved cells."""
+    if method == "idw":
+        return interpolator.IDW(
+            grid_lon, grid_lat, power=power, max_neighbors=max_neighbors,
+            max_distance=max_distance, smoothing=smoothing,
+        )
+    if method == "kriging":
+        return _interpolate_kriging(lon, lat, values, grid_lon, grid_lat, variogram_model)
+    if method == "spline":
+        return _interpolate_spline(lon, lat, values, grid_lon, grid_lat, smoothing, max_neighbors)
+    raise ValueError(f"Unknown interpolation method: {method!r}. Expected one of {sorted(METHOD_LABELS)}.")
 
 
 def _resample_to_grid(src_path: str, ref_path: str) -> np.ndarray:
@@ -112,7 +192,9 @@ def _plot(
     primary_label: str,
     overburden_grid: Optional[np.ndarray],
     epsg: int,
+    method_label: str,
     dpi: int = 200,
+    show_points: bool = True,
 ) -> None:
     ncols = 2 if overburden_grid is not None else 1
     fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 7))
@@ -120,10 +202,11 @@ def _plot(
 
     _render_panel(
         axes[0], primary_grid, "terrain", primary_label,
-        f"{primary_label} — IDW Interpolation", bbox, epsg, fig,
+        f"{primary_label} — {method_label} Interpolation", bbox, epsg, fig,
     )
-    axes[0].scatter(lon, lat, c=values, cmap="terrain", s=40,
-                     edgecolors="black", linewidths=0.8, zorder=5)
+    if show_points:
+        axes[0].scatter(lon, lat, c=values, cmap="terrain", s=40,
+                         edgecolors="black", linewidths=0.8, zorder=5)
 
     if overburden_grid is not None:
         _render_panel(
@@ -148,13 +231,16 @@ def run(
     bbox: Optional[Tuple[float, float, float, float]] = None,
     buffer_frac: float = 0.1,
     resolution: Optional[float] = None,
+    method: str = "idw",
     power: float = 2.0,
     max_neighbors: Optional[int] = None,
     max_distance: Optional[float] = None,
     smoothing: float = 0.0,
+    variogram_model: str = "spherical",
     nodata: float = -9999.0,
     output_dir: PathLike = "geoearthworm_output",
     dpi: int = 200,
+    show_points: bool = True,
 ) -> PipelineResult:
     """Run the full borehole -> bedrock level (+ overburden) -> image pipeline."""
 
@@ -179,25 +265,35 @@ def run(
             "missing values — at least 3 are required for interpolation."
         )
 
+    if method not in METHOD_LABELS:
+        raise ValueError(f"Unknown interpolation method: {method!r}. Expected one of {sorted(METHOD_LABELS)}.")
+
     bbox = bbox or _auto_bbox(lon, lat, buffer_frac)
     resolution = resolution or _auto_resolution(bbox)
 
     interpolator = GeoEarthworm(lon=lon, lat=lat, bedrock=values, epsg=epsg, is_altitude=is_altitude)
     input_stats = interpolator.get_statistics()
 
-    idw_kwargs = dict(
-        bbox=bbox, resolution=resolution, power=power,
-        max_neighbors=max_neighbors, max_distance=max_distance,
-        smoothing=smoothing, nodata_value=nodata,
+    # Native raster: matches the input's own representation (depth or altitude)
+    # directly from the chosen method — never needs a DEM.
+    grid_lon, grid_lat, native_transform = _build_grid(bbox, resolution)
+    native_grid = _interpolate(
+        method, interpolator, lon, lat, values, grid_lon, grid_lat,
+        power=power, max_neighbors=max_neighbors, max_distance=max_distance,
+        smoothing=smoothing, variogram_model=variogram_model,
     )
 
-    # Native raster: matches the input's own representation (depth or altitude)
-    # directly from IDW — never needs a DEM.
+    value_std = float(np.std(values))
+    result_std = float(np.nanstd(native_grid))
+    if value_std > 0 and result_std < 0.02 * value_std:
+        warnings_out.append(
+            f"The interpolated surface is nearly flat (barely varies across the map). This usually "
+            f"means '{METHOD_LABELS[method]}' couldn't find enough spatial structure in your data "
+            "— try IDW, or a different variogram model / less smoothing."
+        )
+
     native_path = output_dir / ("bedrock_altitude.tif" if is_altitude else "bedrock_depth.tif")
-    native_grid, native_transform = interpolator.interpolate_to_raster(
-        output_path=str(native_path), output_depth=not is_altitude, **idw_kwargs
-    )
-    native_grid = _mask_nodata(native_grid, nodata)
+    _write_geotiff(native_path, native_grid, native_transform, epsg, nodata)
 
     depth_path = altitude_path = overburden_path = None
     depth_grid = altitude_grid = overburden_grid = None
@@ -248,12 +344,14 @@ def run(
         image_path, bbox, lon, lat, values,
         primary_grid=primary_grid, primary_label=primary_label,
         overburden_grid=overburden_grid, epsg=epsg, dpi=dpi,
+        method_label=METHOD_LABELS[method], show_points=show_points,
     )
 
     return PipelineResult(
         output_dir=output_dir,
         image_path=image_path,
         input_stats=input_stats,
+        method=METHOD_LABELS[method],
         bedrock_depth_path=depth_path,
         bedrock_altitude_path=altitude_path,
         overburden_path=overburden_path,
