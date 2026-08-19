@@ -14,7 +14,6 @@ from rasterio.warp import reproject, Resampling
 from scipy.spatial import cKDTree
 import warnings
 from typing import Tuple, Optional, Union, List
-from pathlib import Path
 from pyproj import CRS, Transformer
 
 
@@ -407,10 +406,10 @@ class GeoEarthworm:
             warnings.warn(
                 f"{n_negative} pixels had bedrock altitude above surface (IDW extrapolation artifact). "
                 f"Clamping to 0."
-        )
-        overburden = np.where(overburden < 0, 0.0, overburden)  # ← add this line
-            
-            # Replace NaN with nodata sentinel for GeoTIFF output
+            )
+        overburden = np.where(overburden < 0, 0.0, overburden)
+
+        # Replace NaN with nodata sentinel for GeoTIFF output
         overburden_out = np.where(np.isnan(overburden), nodata_value, overburden)
 
         # Write output GeoTIFF
@@ -561,6 +560,29 @@ if __name__ == "__main__":
         max_neighbors=10,
         output_depth=False
     )
+
+    print("\nGenerating synthetic DEM for overburden demo...")
+    dem_cols, dem_rows = 100, 100
+    dem_transform = from_bounds(*bbox, dem_cols, dem_rows)
+    dem_x = np.linspace(bbox[0], bbox[2], dem_cols)
+    dem_y = np.linspace(bbox[3], bbox[1], dem_rows)
+    dem_lon, dem_lat = np.meshgrid(dem_x, dem_y)
+    # Surface kept well above bedrock_altitude's 100-500 range so overburden stays positive
+    dem_array = 650 + 50 * np.sin(dem_lon * 5) + 30 * np.cos(dem_lat * 5)
+
+    with rio.open(
+        "dem.tif", 'w',
+        driver='GTiff',
+        height=dem_rows,
+        width=dem_cols,
+        count=1,
+        dtype=dem_array.dtype,
+        crs=CRS.from_epsg(4326),
+        transform=dem_transform,
+        nodata=-9999.0,
+        compress='lzw'
+    ) as dst:
+        dst.write(dem_array, 1)
 
     print("\nCalculating overburden...")
     overburden, transform = GeoEarthworm.calculate_overburden(

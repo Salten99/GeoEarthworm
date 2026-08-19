@@ -50,7 +50,7 @@ gew = GeoEarthworm(
     lat=lat,
     bedrock=depth,
     epsg=4326,
-    is_bedrock=False   # values are depths, not bedrocks
+    is_altitude=False   # values are depths, not bedrock altitudes
 )
 
 # Auto-detect bounding box from data
@@ -79,13 +79,13 @@ longitude,latitude,bedrock_depth
 ```
 
 ```python
-from geo_earthworm import load_points_from_csv
+from geo_earthworm import GeoEarthworm
 
-lon, lat, depth = load_points_from_csv(
+lon, lat, depth, epsg = GeoEarthworm.load_points_from_csv(
     filepath="points.csv",
     lon_col="longitude",
     lat_col="latitude",
-    value_col="bedrock_depth"
+    bedrock_col="bedrock_depth"
 )
 ```
 
@@ -99,9 +99,9 @@ If your input data is bedrock **bedrock** (not depth), GeoEarthworm can convert 
 gew = GeoEarthworm(
     lon=lon,
     lat=lat,
-    bedrock=bedrock_bedrock,
+    bedrock=bedrock_altitude,
     epsg=4326,
-    is_bedrock=True,
+    is_altitude=True,
     dem_path="path/to/dem.tif"   # surface elevation raster
 )
 
@@ -123,8 +123,8 @@ with rasterio.open("dem.tif") as src:
     dem_transform = src.transform
 
 gew = GeoEarthworm(
-    lon=lon, lat=lat, bedrock=bedrock_bedrock,
-    epsg=4326, is_bedrock=True,
+    lon=lon, lat=lat, bedrock=bedrock_altitude,
+    epsg=4326, is_altitude=True,
     dem_array=dem_arr,
     dem_transform=dem_transform
 )
@@ -132,17 +132,54 @@ gew = GeoEarthworm(
 
 ---
 
+## Command-Line Tool
+
+`run_geoearthworm.py` wraps the library into a single command: point it at a
+borehole CSV (and optionally a DEM) and it writes bedrock-level GeoTIFF(s),
+an overburden GeoTIFF (if a DEM is given), and a summary PNG.
+
+```bash
+# Bedrock level only (no DEM)
+python run_geoearthworm.py --csv boreholes.csv
+
+# Bedrock level + overburden thickness
+python run_geoearthworm.py --csv boreholes.csv --dem dem.tif
+```
+
+By default it expects columns `longitude`, `latitude`, `bedrock_depth` and
+treats the value column as depth below the surface. Use `--lon-col` /
+`--lat-col` / `--value-col` to match your own CSV, and `--values altitude`
+if your column holds bedrock elevation instead of depth.
+
+Run `python run_geoearthworm.py --help` for the full list of options
+(EPSG code, bounding box, resolution, IDW power, neighbor limits, output
+directory, etc.). Outputs default to `geoearthworm_output/`.
+
+---
+
+## Web App
+
+`app.py` is a Streamlit UI over the same pipeline — upload a CSV (and
+optional DEM) in the browser and download the resulting rasters and image.
+
+```bash
+pip install -r requirements-app.txt
+streamlit run app.py
+```
+
+---
+
 ## API Reference
 
-### `GeoEarthworm(lon, lat, bedrock, epsg, is_bedrock, dem_path, dem_array, dem_transform)`
+### `GeoEarthworm(lon, lat, bedrock, epsg, is_altitude, dem_path, dem_array, dem_transform)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `lon` | list / ndarray | required | Longitude coordinates |
 | `lat` | list / ndarray | required | Latitude coordinates |
-| `bedrock` | list / ndarray | required | Bedrock depth or bedrock values |
+| `bedrock` | list / ndarray | required | Bedrock depth or altitude values |
 | `epsg` | int | `4326` | EPSG CRS code |
-| `is_bedrock` | bool | `False` | `True` if values are bedrock, `False` if depth |
+| `is_altitude` | bool | `False` | `True` if values are bedrock altitude, `False` if depth |
 | `dem_path` | str | `None` | Path to DEM GeoTIFF (optional) |
 | `dem_array` | ndarray | `None` | DEM array (alternative to `dem_path`) |
 | `dem_transform` | Affine | `None` | Required when using `dem_array` |
@@ -192,9 +229,9 @@ Returns a dict with `min`, `max`, `mean`, `std`, `count` for input or interpolat
 
 ---
 
-### `load_points_from_csv(filepath, lon_col, lat_col, value_col, delimiter, skiprows)`
+### `GeoEarthworm.load_points_from_csv(filepath, lon_col, lat_col, bedrock_col, epsg, target_epsg, delimiter, skiprows)`
 
-Loads borehole data from CSV. Returns `(lon, lat, values)` as NumPy arrays with NaN rows removed.
+Static method. Loads borehole data from CSV and optionally reprojects coordinates. Returns `(lon, lat, bedrock, epsg)` as NumPy arrays (plus the output EPSG code) with NaN rows removed.
 
 ---
 

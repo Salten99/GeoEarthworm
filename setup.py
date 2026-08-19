@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 from pathlib import Path
 
 long_description = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
@@ -11,7 +11,7 @@ setup(
     description="Bedrock depth interpolation from scattered borehole measurements using IDW",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/YOUR_USERNAME/geo-earthworm",
+    url="https://github.com/Salten99/GeoEarthworm",
     py_modules=["geo_earthworm"],
     python_requires=">=3.8",
     install_requires=[
@@ -19,6 +19,7 @@ setup(
         "scipy>=1.9.0",
         "rasterio>=1.3.0",
         "pandas>=1.5.0",
+        "pyproj>=3.4.0",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
