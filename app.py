@@ -18,6 +18,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import pydeck as pdk
 import rasterio as rio
 import streamlit as st
@@ -146,6 +147,117 @@ def show_image(png_bytes, alt):
     # st.image writes alt="0"; an <img> tag lets screen readers hear what the map shows.
     src = "data:image/png;base64," + base64.b64encode(png_bytes).decode()
     st.markdown(f'<img src="{src}" alt="{alt}" style="width:100%; height:auto">', unsafe_allow_html=True)
+
+
+def read_grid(tif_bytes):
+    """North-up array plus cell-centre x/y coordinates from GeoTIFF bytes."""
+    with rio.MemoryFile(tif_bytes) as mem, mem.open() as src:
+        grid = src.read(1, masked=True).astype(float).filled(np.nan)
+        t = src.transform
+        x = t.c + (np.arange(src.width) + 0.5) * t.a
+        y = t.f + (np.arange(src.height) + 0.5) * t.e
+    return grid, x, y
+
+
+def ground_model(run_record):
+    """Bedrock and ground surface as heights in metres, rebuilt from a run's GeoTIFFs."""
+    tifs = {name: data for _, name, data in run_record["downloads"]}
+    depth = read_grid(tifs["bedrock_depth.tif"])[0] if "bedrock_depth.tif" in tifs else None
+    if "bedrock_altitude.tif" in tifs:
+        bed, x, y = read_grid(tifs["bedrock_altitude.tif"])
+        top = bed + depth if depth is not None else None  # both exist only when a DEM was given
+        unit = "Elevation (m)"
+    else:
+        depth, x, y = read_grid(tifs["bedrock_depth.tif"])
+        bed, top = -depth, np.zeros_like(depth)  # no DEM: heights relative to the ground
+        unit = "Height relative to ground (m)"
+    return {"x": x, "y": y, "bed": bed, "top": top, "unit": unit}
+
+
+def plotly_layout(fig, height):
+    fig.update_layout(
+        height=height, margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#23180E"), legend=dict(orientation="h", y=1.02, x=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def cross_section(model, geographic):
+    x, y = model["x"], model["y"]
+    direction = st.radio("Section runs", ["West to east", "South to north"], horizontal=True)
+    west_east = direction == "West to east"
+    along, across = (x, y) if west_east else (y, x)
+    names = ("Longitude (°)", "Latitude (°)") if geographic else ("Easting", "Northing")
+    along_name, across_name = names if west_east else names[::-1]
+    pos = st.slider(
+        f"{across_name.split(' ')[0]} of the section line", float(across.min()), float(across.max()),
+        float(np.median(across)), format="%.4f" if geographic else "%.0f",
+    )
+    i = int(np.abs(across - pos).argmin())
+    pick = (lambda g: g[i, :]) if west_east else (lambda g: g[:, i])
+    bed = pick(model["bed"])
+    top = None if model["top"] is None else pick(model["top"])
+
+    highest = np.nanmax(top) if top is not None else np.nanmax(bed)
+    floor = np.nanmin(bed) - 0.15 * ((highest - np.nanmin(bed)) or 1)
+    fig = go.Figure()
+    fig.add_scatter(x=along, y=np.full_like(bed, floor), line_width=0, hoverinfo="skip", showlegend=False)
+    fig.add_scatter(x=along, y=bed, name="Bedrock surface", fill="tonexty", fillcolor="#4C4238",
+                    line=dict(color="#E9C98A", width=2), hovertemplate="%{y:,.1f} m")
+    if top is not None:
+        fig.add_scatter(x=along, y=top, name="Ground surface", fill="tonexty", fillcolor="rgba(201,163,101,0.8)",
+                        line=dict(color="#5E4026", width=2), hovertemplate="%{y:,.1f} m")
+    fig.update_xaxes(title=along_name, showgrid=False)
+    fig.update_yaxes(title=model["unit"], gridcolor="rgba(35,24,14,0.12)")
+    fig.update_layout(hovermode="x unified")
+    plotly_layout(fig, 420)
+    if top is None:
+        st.caption("Upload a DEM to see the ground surface and the overburden between it and the bedrock.")
+
+
+def view_3d(model, run_record, geographic, show_points):
+    step = max(1, int(np.ceil(max(model["bed"].shape) / 150)))  # keep the mesh light enough for the browser
+    x, y = model["x"][::step], model["y"][::step]
+    bed = model["bed"][::step, ::step]
+    top = None if model["top"] is None else model["top"][::step, ::step]
+    is_depth = run_record["primary_label"].startswith("Bedrock depth")
+    colour = top - bed if is_depth else bed  # colour by the quantity the run mapped
+    stops = matplotlib.colormaps[run_record["overlay"]["cmap"]](np.linspace(0, 1, 8))
+    scale = [[k / 7, matplotlib.colors.to_hex(c)] for k, c in enumerate(stops)]
+
+    fig = go.Figure(go.Surface(
+        x=x, y=y, z=bed, surfacecolor=colour, colorscale=scale, name="Bedrock surface",
+        colorbar=dict(title=dict(text=run_record["primary_label"], side="right"), thickness=14),
+        hovertemplate="%{z:,.1f} m<extra>Bedrock</extra>",
+    ))
+    if top is not None:
+        fig.add_surface(x=x, y=y, z=top, showscale=False, opacity=0.3, name="Ground surface",
+                        colorscale=[[0, "#C9A365"], [1, "#C9A365"]], hovertemplate="%{z:,.1f} m<extra>Ground</extra>")
+    if show_points:
+        pts = run_record["points"]
+        ix = np.abs(model["x"][None, :] - pts["x"].to_numpy()[:, None]).argmin(axis=1)
+        iy = np.abs(model["y"][None, :] - pts["y"].to_numpy()[:, None]).argmin(axis=1)
+        z_bed = model["bed"][iy, ix]
+        z_top = model["top"][iy, ix] if model["top"] is not None else z_bed
+        # One polyline with NaN breaks draws every borehole as a vertical drill line.
+        seg = lambda a, b: np.column_stack([a, b, np.full(len(a), np.nan)]).ravel()
+        fig.add_scatter3d(x=seg(pts["x"], pts["x"]), y=seg(pts["y"], pts["y"]), z=seg(z_top, z_bed),
+                          mode="lines", line=dict(color="#1E150C", width=4), name="Boreholes", hoverinfo="skip")
+        fig.add_scatter3d(x=pts["x"], y=pts["y"], z=z_bed, mode="markers", name="Bedrock contact",
+                          marker=dict(size=4, color="#E9C98A", line=dict(color="#1E150C", width=1)),
+                          text=pts["label"], hovertemplate="%{text}<extra>Borehole</extra>")
+
+    span_x = (x.max() - x.min()) * (np.cos(np.radians(y.mean())) if geographic else 1)
+    span_y = y.max() - y.min()
+    biggest = max(span_x, span_y) or 1
+    names = ("Longitude", "Latitude") if geographic else ("Easting", "Northing")
+    fig.update_layout(scene=dict(
+        xaxis_title=names[0], yaxis_title=names[1], zaxis_title=model["unit"],
+        aspectmode="manual", aspectratio=dict(x=span_x / biggest, y=span_y / biggest, z=0.35),
+    ))
+    plotly_layout(fig, 560)
+    st.caption("Drag to rotate, scroll to zoom. Height is exaggerated so the bedrock shape is easy to see.")
 
 
 def describe_settings(s):
@@ -425,6 +537,7 @@ with results_col:
                 ]
                 pts["label"] = [f"{val:,.1f} m" for val in pts["value"]]
                 pts["where"] = [f"{la:.5f}, {lo:.5f}" for lo, la in zip(pts["lon"], pts["lat"])]
+                pts["x"], pts["y"] = x[valid].to_numpy(), y[valid].to_numpy()  # native CRS, for the 3D view
 
                 st.session_state.run_counter += 1
                 st.session_state.runs.append({
@@ -473,7 +586,7 @@ with results_col:
                     st.pydeck_chart(pdk.Deck(
                         layers=[pdk.Layer(
                             "ScatterplotLayer", data=preview, get_position=["lon", "lat"],
-                            get_fill_color=[138, 90, 20], get_line_color=[255, 255, 255], stroked=True,
+                            get_fill_color=[116, 73, 13], get_line_color=[255, 255, 255], stroked=True,
                             line_width_min_pixels=1.5, get_radius=5, radius_units=pdk.types.String("pixels"),
                         )],
                         initial_view_state=pdk.data_utils.compute_view(preview),
@@ -491,15 +604,21 @@ with results_col:
         for w in latest["warnings"]:
             st.warning(w)
 
-        tab_names = ["Map", "Summary image"] + (["Compare runs"] if len(runs) > 1 else [])
+        tab_names = ["Map", "Cross-section", "3D view", "Summary image"] + (["Compare runs"] if len(runs) > 1 else [])
         tabs = st.tabs(tab_names)
+        model = ground_model(latest)
+        geographic = CRS.from_epsg(latest["settings"]["epsg"]).is_geographic
         with tabs[0]:
             show_points = st.toggle("Show boreholes", value=True)
             run_map(latest, show_points)
         with tabs[1]:
+            cross_section(model, geographic)
+        with tabs[2]:
+            view_3d(model, latest, geographic, st.toggle("Show boreholes", value=True, key="boreholes_3d"))
+        with tabs[3]:
             show_image(latest["image"], f"Summary map of {latest['primary_label'].lower()} for {latest['name']}")
         if len(runs) > 1:
-            with tabs[2]:
+            with tabs[4]:
                 names = [r["name"] for r in runs]
                 picked = st.multiselect("Runs to compare", names, default=names[-2:], max_selections=3)
                 if picked:
