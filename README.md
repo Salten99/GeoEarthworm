@@ -2,6 +2,8 @@
 
 **Bedrock depth interpolation from scattered borehole measurements.**
 
+**Try it in your browser:** https://salten99.github.io/GeoEarthworm/
+
 GeoEarthworm provides rapid, easy-to-use bedrock interpolations using Inverse Distance Weighting (IDW). It supports coordinate transformations, optional DEM integration for bedrock-to-depth conversion, and GeoTIFF raster output.
 
 ---
