@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,12 @@ from rasterio.warp import reproject, Resampling
 from geo_earthworm import GeoEarthworm
 
 PathLike = Union[str, Path]
+
+# Depth: one-hue-family ramp, light = shallow, dark = deep. Altitude keeps the conventional terrain ramp.
+PRIMARY_CMAPS = {
+    "Bedrock depth (m)": "YlGnBu",
+    "Bedrock altitude (m)": "terrain",
+}
 
 METHOD_LABELS = {
     "idw": "IDW",
@@ -173,13 +179,19 @@ def _write_geotiff(path: Path, array: np.ndarray, transform, epsg: int, nodata: 
 
 def _render_panel(ax, grid, cmap, label, title, bbox, epsg, fig):
     extent = [bbox[0], bbox[2], bbox[1], bbox[3]]
-    im = ax.imshow(grid, extent=extent, origin="upper", cmap=cmap)
+    # Geographic degrees: stretch y so a degree of longitude isn't drawn as wide as a degree of latitude.
+    geographic = CRS.from_epsg(epsg).is_geographic
+    aspect = 1 / np.cos(np.radians((bbox[1] + bbox[3]) / 2)) if geographic else 1
+    im = ax.imshow(grid, extent=extent, origin="upper", cmap=cmap, aspect=aspect)
     fig.colorbar(im, ax=ax, shrink=0.8, label=label)
-    ax.set_xlabel(f"X (EPSG:{epsg})")
-    ax.set_ylabel(f"Y (EPSG:{epsg})")
-    ax.set_title(title)
-    ax.set_xlim(bbox[0], bbox[2])
-    ax.set_ylim(bbox[1], bbox[3])
+    ax.set_xlabel("Longitude (°)" if geographic else f"Easting (EPSG:{epsg})")
+    ax.set_ylabel("Latitude (°)" if geographic else f"Northing (EPSG:{epsg})")
+    ax.set_title(title, loc="left")
+    ax.ticklabel_format(useOffset=False, style="plain")
+    for spine in ax.spines.values():
+        spine.set_color("#9aa3a0")
+    ax.tick_params(colors="#4a5552")
+    return im
 
 
 def _plot(
@@ -200,21 +212,22 @@ def _plot(
     fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 7))
     axes = np.atleast_1d(axes)
 
-    _render_panel(
-        axes[0], primary_grid, "terrain", primary_label,
-        f"{primary_label} — {method_label} Interpolation", bbox, epsg, fig,
+    cmap = PRIMARY_CMAPS[primary_label]
+    im = _render_panel(
+        axes[0], primary_grid, cmap, primary_label,
+        f"{primary_label}, {method_label}", bbox, epsg, fig,
     )
     if show_points:
-        axes[0].scatter(lon, lat, c=values, cmap="terrain", s=40,
-                         edgecolors="black", linewidths=0.8, zorder=5)
+        # Same norm as the grid so a dot's colour reads off the same colour bar.
+        axes[0].scatter(lon, lat, c=values, cmap=cmap, norm=im.norm, s=36,
+                        edgecolors="white", linewidths=1.2, zorder=5)
 
     if overburden_grid is not None:
         _render_panel(
-            axes[1], overburden_grid, "YlOrBr", "Overburden Thickness (m)",
-            "Overburden Thickness", bbox, epsg, fig,
+            axes[1], overburden_grid, "YlOrBr", "Overburden thickness (m)",
+            "Overburden thickness (m)", bbox, epsg, fig,
         )
 
-    fig.suptitle("GeoEarthworm — Bedrock & Overburden Interpolation")
     fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -241,13 +254,20 @@ def run(
     output_dir: PathLike = "geoearthworm_output",
     dpi: int = 200,
     show_points: bool = True,
+    on_step: Optional[Callable[[str], None]] = None,
 ) -> PipelineResult:
-    """Run the full borehole -> bedrock level (+ overburden) -> image pipeline."""
+    """Run the full borehole -> bedrock level (+ overburden) -> image pipeline.
+
+    on_step, if given, is called with a short description as each stage starts.
+    """
+    step = on_step or (lambda _msg: None)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warnings_out: list = []
+    csv_name = Path(csv_path).name
 
+    step("Reading borehole data")
     try:
         lon, lat, values, epsg = GeoEarthworm.load_points_from_csv(
             filepath=str(csv_path), lon_col=lon_col, lat_col=lat_col,
@@ -256,12 +276,12 @@ def run(
     except KeyError as e:
         cols = list(pd.read_csv(csv_path, nrows=0).columns)
         raise ValueError(
-            f"Column {e} not found in '{csv_path}'. Available columns: {cols}"
+            f"Column {e} not found in '{csv_name}'. Available columns: {cols}"
         ) from e
 
     if len(lon) < 3:
         raise ValueError(
-            f"Only {len(lon)} valid point(s) found in '{csv_path}' after dropping rows with "
+            f"Only {len(lon)} valid point(s) found in '{csv_name}' after dropping rows with "
             "missing values — at least 3 are required for interpolation."
         )
 
@@ -276,6 +296,7 @@ def run(
 
     # Native raster: matches the input's own representation (depth or altitude)
     # directly from the chosen method — never needs a DEM.
+    step(f"Interpolating with {METHOD_LABELS[method]}")
     grid_lon, grid_lat, native_transform = _build_grid(bbox, resolution)
     native_grid = _interpolate(
         method, interpolator, lon, lat, values, grid_lon, grid_lat,
@@ -286,10 +307,14 @@ def run(
     value_std = float(np.std(values))
     result_std = float(np.nanstd(native_grid))
     if value_std > 0 and result_std < 0.02 * value_std:
+        remedy = {
+            "idw": "try a higher IDW power or less smoothing",
+            "kriging": "try a different variogram model, or switch to IDW",
+            "spline": "try less smoothing, or switch to IDW",
+        }[method]
         warnings_out.append(
             f"The interpolated surface is nearly flat (barely varies across the map). This usually "
-            f"means '{METHOD_LABELS[method]}' couldn't find enough spatial structure in your data "
-            "— try IDW, or a different variogram model / less smoothing."
+            f"means {METHOD_LABELS[method]} couldn't find enough spatial structure in your data; {remedy}."
         )
 
     native_path = output_dir / ("bedrock_altitude.tif" if is_altitude else "bedrock_depth.tif")
@@ -305,6 +330,7 @@ def run(
         depth_path, depth_grid = native_path, native_grid
 
     if dem_path is not None:
+        step("Combining with the surface elevation model")
         # Derive whichever of depth/altitude is missing by resampling the DEM
         # onto the native raster's grid (reprojects if the DEM's CRS differs).
         dem_on_grid = _resample_to_grid(str(dem_path), str(native_path))
@@ -328,17 +354,24 @@ def run(
         altitude_stats = interpolator.get_statistics(altitude_grid, nodata_value=nodata)
         overburden_stats = interpolator.get_statistics(overburden_grid, nodata_value=nodata)
     else:
+        native_stats = interpolator.get_statistics(native_grid, nodata_value=nodata)
+        if is_altitude:
+            altitude_stats = native_stats
+        else:
+            depth_stats = native_stats
         kind = "bedrock altitude" if is_altitude else "bedrock depth"
         warnings_out.append(
             f"No DEM supplied: overburden thickness was not computed, and only the native "
             f"{kind} raster was produced."
         )
 
-    if depth_grid is not None:
-        primary_grid, primary_label = depth_grid, "Bedrock Depth (m)"
+    # Plot the quantity the boreholes measured, so the dots and the grid share one colour scale.
+    if is_altitude:
+        primary_grid, primary_label = altitude_grid, "Bedrock altitude (m)"
     else:
-        primary_grid, primary_label = altitude_grid, "Bedrock Altitude (m)"
+        primary_grid, primary_label = depth_grid, "Bedrock depth (m)"
 
+    step("Drawing the summary map")
     image_path = output_dir / "bedrock_overburden_map.png"
     _plot(
         image_path, bbox, lon, lat, values,
