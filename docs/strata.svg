@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 170" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Cross-section of soil and rock layers, with three boreholes drilled down to the bedrock surface">
+  <defs>
+    <pattern id="sand" width="10" height="10" patternUnits="userSpaceOnUse">
+      <rect width="10" height="10" fill="#C9A365"/>
+      <circle cx="2" cy="3" r="0.9" fill="#9C7A42"/><circle cx="7" cy="8" r="0.7" fill="#9C7A42"/>
+    </pattern>
+    <pattern id="clay" width="40" height="6" patternUnits="userSpaceOnUse">
+      <rect width="40" height="6" fill="#A8743A"/>
+      <path d="M0 3h16M22 3h14" stroke="#8E5F2C" stroke-width="0.8"/>
+    </pattern>
+    <pattern id="till" width="26" height="18" patternUnits="userSpaceOnUse">
+      <rect width="26" height="18" fill="#7E5A2E"/>
+      <ellipse cx="6" cy="5" rx="3.2" ry="2.2" fill="#A98455"/>
+      <ellipse cx="18" cy="13" rx="2.4" ry="1.7" fill="#9A7547"/>
+      <circle cx="21" cy="4" r="1.1" fill="#B79466"/>
+    </pattern>
+    <pattern id="rock" width="34" height="20" patternUnits="userSpaceOnUse">
+      <rect width="34" height="20" fill="#4C4238"/>
+      <path d="M0 10h34M17 0v10M8 10v10M26 10v10" stroke="#3B332B" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <!-- Layers drawn top to bottom; each fills down to the base so the next one overlays it. -->
+  <path d="M0 18 C200 6 400 28 600 15 S1000 8 1200 20 V170 H0Z" fill="#5E4026"/>
+  <path d="M0 30 C200 20 400 40 600 28 S1000 22 1200 33 V170 H0Z" fill="url(#sand)"/>
+  <path d="M0 58 C250 46 450 74 650 56 S1000 48 1200 66 V170 H0Z" fill="url(#clay)"/>
+  <path d="M0 88 C220 80 480 106 700 86 S1020 76 1200 96 V170 H0Z" fill="url(#till)"/>
+  <path d="M0 124 C150 108 300 136 450 114 S750 96 900 128 S1100 116 1200 106 V170 H0Z" fill="url(#rock)"/>
+  <!-- Bedrock surface, the thing GeoEarthworm maps. -->
+  <path d="M0 124 C150 108 300 136 450 114 S750 96 900 128 S1100 116 1200 106" fill="none" stroke="#E9C98A" stroke-width="1.5"/>
+  <g stroke="#1E150C" stroke-width="3" stroke-linecap="round">
+    <line x1="190" y1="12" x2="190" y2="120"/>
+    <line x1="560" y1="18" x2="560" y2="103"/>
+    <line x1="970" y1="10" x2="970" y2="138"/>
+  </g>
+  <g fill="#E9C98A" stroke="#1E150C" stroke-width="2">
+    <circle cx="190" cy="120" r="5"/>
+    <circle cx="560" cy="103" r="5"/>
+    <circle cx="970" cy="138" r="5"/>
+  </g>
+</svg>

@@ -1,11 +1,11 @@
 # GeoEarthworm look: ochre earth tones. Page background carries faint contour lines (set in app.py).
-# White text on primaryColor is ~6:1, so buttons stay readable.
+# White text on primaryColor is ~7.8:1, so buttons stay readable.
 [theme]
 base = "light"
-primaryColor = "#8A5A14"
-backgroundColor = "#F4ECDD"
-secondaryBackgroundColor = "#E9DCC3"
-textColor = "#2B2118"
+primaryColor = "#74490D"
+backgroundColor = "#E4D5B7"
+secondaryBackgroundColor = "#D6C29C"
+textColor = "#23180E"
 font = "sans serif"
 
 [client]

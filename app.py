@@ -44,7 +44,7 @@ COLUMN_GUESSES = {
 
 st.set_page_config(page_title="GeoEarthworm", page_icon=":world_map:", layout="wide")
 
-OCHRE = "#8A5A14"  # keep in sync with primaryColor in .streamlit/config.toml
+OCHRE = "#74490D"  # keep in sync with primaryColor in .streamlit/config.toml
 
 # Streamlit's own focus ring is a faint primary-colour glow; give keyboard users a solid one.
 st.markdown(
@@ -54,6 +54,7 @@ st.markdown(
     }}
     ::selection {{ background: #E9C98A; }}
     h2 {{ font-size: 1.4rem !important; padding-top: 1.25rem !important; }}
+    .gew-strata {{ display: block; width: 100%; height: 110px; border-radius: 6px; margin: .25rem 0 .5rem; }}
     .gew-legend {{ display: flex; align-items: center; gap: .6rem; font-size: .85rem; margin: .4rem 0 .2rem; }}
     .gew-legend .bar {{ flex: 1; height: .7rem; border-radius: 2px; }}
     [data-testid="stApp"] {{ background-size: cover; background-position: center; background-attachment: fixed; }}
@@ -208,6 +209,13 @@ def run_map(run_record, show_points):
 
 st.title("GeoEarthworm")
 st.caption("Interpolate bedrock depth and overburden thickness from borehole measurements.")
+# Shared with the GitHub Pages landing page, so it lives in docs/.
+strata = base64.b64encode((Path(__file__).parent / "docs" / "strata.svg").read_bytes()).decode()
+st.markdown(
+    f'<img class="gew-strata" src="data:image/svg+xml;base64,{strata}" '
+    'alt="Cross-section of soil and rock layers, with three boreholes drilled down to the bedrock surface">',
+    unsafe_allow_html=True,
+)
 
 settings_col, results_col = st.columns([1, 2.1], gap="large")
 
