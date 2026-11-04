@@ -20,6 +20,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import rasterio as rio
 from rasterio.crs import CRS
+from rasterio.errors import RasterioIOError
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject, Resampling, transform_bounds
 
@@ -29,6 +30,17 @@ PathLike = Union[str, Path]
 
 USGS_3DEP_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 USGS_MAX_PIXELS = 8000  # the service's maxImageWidth/maxImageHeight
+
+# Without these, using every borehole for every cell needs memory for cells x boreholes.
+AUTO_NEIGHBORS = 32
+AUTO_NEIGHBORS_ABOVE = 1000
+
+# Only with server_limits: one request must not take down a small shared server.
+SERVER_MAX_CELLS = 4_000_000
+SERVER_MAX_KRIGING_POINTS = 2000
+
+# Values DEMs often use for gaps without declaring them as NoData.
+UNDECLARED_DEM_GAPS = (-9999, -32768)
 
 # Depth: one-hue-family ramp, light = shallow, dark = deep. Altitude keeps the conventional terrain ramp.
 PRIMARY_CMAPS = {
@@ -77,14 +89,22 @@ def _mask_nodata(array: np.ndarray, nodata: float) -> np.ndarray:
     return np.where(array == nodata, np.nan, array)
 
 
-def _build_grid(bbox: Tuple[float, float, float, float], resolution: float):
+def _build_grid(bbox: Tuple[float, float, float, float], resolution: float, max_cells: Optional[int] = None):
     """Build the output grid + its GeoTIFF affine transform from a bbox and resolution."""
     min_lon, min_lat, max_lon, max_lat = bbox
     cols = int(np.ceil((max_lon - min_lon) / resolution))
     rows = int(np.ceil((max_lat - min_lat) / resolution))
+    if cols < 1 or rows < 1:
+        raise ValueError(f"Grid resolution must be a positive number, not {resolution}.")
+    if max_cells is not None and cols * rows > max_cells:
+        raise ValueError(
+            f"A resolution of {resolution} needs a grid of {cols:,} x {rows:,} cells, more than the "
+            f"{max_cells:,} allowed here. Use a larger resolution, or run GeoEarthworm on your own computer."
+        )
 
-    x = np.linspace(min_lon, max_lon, cols)
-    y = np.linspace(max_lat, min_lat, rows)  # top to bottom, matches raster row order
+    # Pixel centres, so values land where the transform below says they are.
+    x = min_lon + (np.arange(cols) + 0.5) * (max_lon - min_lon) / cols
+    y = max_lat - (np.arange(rows) + 0.5) * (max_lat - min_lat) / rows  # top to bottom, matches raster row order
     grid_lon, grid_lat = np.meshgrid(x, y)
 
     transform = from_bounds(min_lon, min_lat, max_lon, max_lat, cols, rows)
@@ -142,10 +162,11 @@ def _interpolate(
             grid_lon, grid_lat, power=power, max_neighbors=max_neighbors,
             max_distance=max_distance, smoothing=smoothing,
         )
+    scale = interpolator.x_scale  # IDW applies this itself
     if method == "kriging":
-        return _interpolate_kriging(lon, lat, values, grid_lon, grid_lat, variogram_model)
+        return _interpolate_kriging(lon * scale, lat, values, grid_lon * scale, grid_lat, variogram_model)
     if method == "spline":
-        return _interpolate_spline(lon, lat, values, grid_lon, grid_lat, smoothing, max_neighbors)
+        return _interpolate_spline(lon * scale, lat, values, grid_lon * scale, grid_lat, smoothing, max_neighbors)
     raise ValueError(f"Unknown interpolation method: {method!r}. Expected one of {sorted(METHOD_LABELS)}.")
 
 
@@ -197,6 +218,38 @@ def fetch_usgs_dem(bbox: Tuple[float, float, float, float], epsg: int, shape: Tu
     # The service reports errors as JSON with a 200 and a TIFF content type, so rio.open is the real check.
     with rio.open(out_path) as src:
         return src.read(1, masked=True).count() / (src.width * src.height)
+
+
+def _prepare_dem(dem_path: PathLike, output_dir: Path, warnings_out: list) -> PathLike:
+    """Reject a DEM that can't be used, and mark common gap values the file doesn't declare as NoData."""
+    try:
+        with rio.open(dem_path) as src:
+            if not src.crs:
+                raise ValueError(
+                    "The DEM has no coordinate system, so it can't be placed on the map. "
+                    "Export it again with one set."
+                )
+            if src.nodata is not None:
+                return dem_path
+            data = src.read(1).astype(np.float32)
+            profile = src.profile
+    except RasterioIOError as e:
+        raise ValueError("The DEM file couldn't be read as a GeoTIFF.") from e
+
+    gaps = np.isin(data, UNDECLARED_DEM_GAPS)
+    if not gaps.any():
+        return dem_path
+
+    warnings_out.append(
+        f"Treated {int(gaps.sum()):,} DEM cells holding {', '.join(map(str, UNDECLARED_DEM_GAPS))} as missing "
+        "data, because the file doesn't say which value marks gaps."
+    )
+    data[gaps] = UNDECLARED_DEM_GAPS[0]
+    profile.update(driver="GTiff", count=1, dtype="float32", nodata=UNDECLARED_DEM_GAPS[0])
+    marked = output_dir / "dem_gaps_marked.tif"
+    with rio.open(marked, "w", **profile) as dst:
+        dst.write(data, 1)
+    return marked
 
 
 def _write_geotiff(path: Path, array: np.ndarray, transform, epsg: int, nodata: float) -> None:
@@ -289,11 +342,13 @@ def run(
     show_points: bool = True,
     on_step: Optional[Callable[[str], None]] = None,
     fetch_dem: bool = False,
+    server_limits: bool = False,
 ) -> PipelineResult:
     """Run the full borehole -> bedrock level (+ overburden) -> image pipeline.
 
     on_step, if given, is called with a short description as each stage starts.
     fetch_dem downloads a USGS DEM for the map area when dem_path isn't given (US coverage only).
+    server_limits refuses work too big for a small shared server (the web app sets this).
     """
     step = on_step or (lambda _msg: None)
 
@@ -314,6 +369,10 @@ def run(
             f"Column {e} not found in '{csv_name}'. Available columns: {cols}"
         ) from e
 
+    skipped = len(pd.read_csv(csv_path, usecols=[value_col])) - len(lon)
+    if skipped:
+        warnings_out.append(f"Skipped {skipped:,} row(s) with a missing or non-numeric position or bedrock value.")
+
     if len(lon) < 3:
         raise ValueError(
             f"Only {len(lon)} valid point(s) found in '{csv_name}' after dropping rows with "
@@ -322,6 +381,22 @@ def run(
 
     if method not in METHOD_LABELS:
         raise ValueError(f"Unknown interpolation method: {method!r}. Expected one of {sorted(METHOD_LABELS)}.")
+
+    if server_limits and method == "kriging" and len(lon) > SERVER_MAX_KRIGING_POINTS:
+        raise ValueError(
+            f"Kriging is limited to {SERVER_MAX_KRIGING_POINTS:,} boreholes here, and this file has {len(lon):,}. "
+            "Use IDW, or run GeoEarthworm on your own computer."
+        )
+
+    if method in ("idw", "spline") and max_neighbors is None and len(lon) > AUTO_NEIGHBORS_ABOVE:
+        max_neighbors = AUTO_NEIGHBORS
+        warnings_out.append(
+            f"With {len(lon):,} boreholes, each map cell uses its nearest {AUTO_NEIGHBORS}. "
+            "Set max neighbours to change this."
+        )
+
+    if dem_path is not None:
+        dem_path = _prepare_dem(dem_path, output_dir, warnings_out)
 
     bbox = bbox or _auto_bbox(lon, lat, buffer_frac)
     resolution = resolution or _auto_resolution(bbox)
@@ -332,7 +407,9 @@ def run(
     # Native raster: matches the input's own representation (depth or altitude)
     # directly from the chosen method — never needs a DEM.
     step(f"Interpolating with {METHOD_LABELS[method]}")
-    grid_lon, grid_lat, native_transform = _build_grid(bbox, resolution)
+    grid_lon, grid_lat, native_transform = _build_grid(
+        bbox, resolution, max_cells=SERVER_MAX_CELLS if server_limits else None,
+    )
     native_grid = _interpolate(
         method, interpolator, lon, lat, values, grid_lon, grid_lat,
         power=power, max_neighbors=max_neighbors, max_distance=max_distance,
@@ -380,17 +457,23 @@ def run(
                 warnings_out.append(f"USGS has no elevation data for this area (it covers the US). {no_overburden}")
             else:
                 dem_path, dem_source = usgs_path, "USGS 3DEP"
-                if coverage < 0.99:
-                    warnings_out.append(
-                        f"USGS elevation data covers only {coverage:.0%} of this map, so surface-based "
-                        "results are blank elsewhere."
-                    )
 
     if dem_path is not None:
         step("Combining with the surface elevation model")
         # Derive whichever of depth/altitude is missing by resampling the DEM
         # onto the native raster's grid (reprojects if the DEM's CRS differs).
         dem_on_grid = _resample_to_grid(str(dem_path), str(native_path))
+        covered = float(np.isfinite(dem_on_grid).mean())
+        if covered == 0:
+            raise ValueError(
+                "The DEM doesn't overlap the map area. Check that it covers your boreholes, "
+                "and that you chose the right coordinate system."
+            )
+        if covered < 0.99:
+            warnings_out.append(
+                f"The surface elevation covers only {covered:.0%} of this map, so surface-based results "
+                "are blank elsewhere."
+            )
         if is_altitude:
             depth_grid = dem_on_grid - altitude_grid
             depth_path = output_dir / "bedrock_depth.tif"

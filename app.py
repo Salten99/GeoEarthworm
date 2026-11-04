@@ -338,7 +338,7 @@ settings = {}
 with settings_col:
     st.header("1. Borehole data")
     csv_file = st.file_uploader(
-        "Borehole CSV", type=["csv"],
+        "Borehole CSV", type=["csv"], max_upload_size=20,
         help="A spreadsheet (.csv) with one row per borehole. It needs at least a "
              "longitude column, a latitude column, and a bedrock value column.",
     )
@@ -394,7 +394,7 @@ with settings_col:
         x = pd.to_numeric(df[lon_col], errors="coerce")
         y = pd.to_numeric(df[lat_col], errors="coerce")
         v = pd.to_numeric(df[value_col], errors="coerce")
-        valid = x.notna() & y.notna() & v.notna()
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)  # same rule as load_points_from_csv
         n_valid = int(valid.sum())
 
         if crs is not None and n_valid:
@@ -458,9 +458,9 @@ with settings_col:
     with st.expander("Advanced settings"):
         if method in ("idw", "spline"):
             max_neighbors = st.number_input(
-                "Max neighbours (0 = use all)", value=0, min_value=0,
-                help="Limits each map cell's estimate to its N nearest boreholes. 0 uses all points "
-                     "(best for small datasets); a smaller number is faster on large datasets.",
+                "Max neighbours (0 = automatic)", value=0, min_value=0, max_value=1000,
+                help="Limits each map cell's estimate to its N nearest boreholes. 0 uses all of them, "
+                     "or the nearest 32 above 1,000 boreholes. A smaller number is faster.",
             )
         resolution_auto = st.checkbox(
             "Choose grid resolution automatically", value=True,
@@ -500,11 +500,11 @@ with results_col:
             try:
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_dir = Path(tmp)
-                    csv_path = tmp_dir / csv_file.name
+                    csv_path = tmp_dir / "boreholes.csv"  # never a path from the browser's filename
                     csv_path.write_bytes(csv_file.getvalue())
                     dem_path = None
                     if dem_file is not None:
-                        dem_path = tmp_dir / dem_file.name
+                        dem_path = tmp_dir / "dem.tif"
                         dem_path.write_bytes(dem_file.getvalue())
 
                     result = run(
@@ -515,7 +515,7 @@ with results_col:
                         buffer_frac=buffer, resolution=resolution, method=method, power=power,
                         max_neighbors=settings["max_neighbors"] or None, smoothing=smoothing,
                         variogram_model=variogram_model, output_dir=tmp_dir / "output",
-                        on_step=status.write,
+                        on_step=status.write, server_limits=True,
                     )
 
                     # Read everything out now: the temp directory is gone after this block.

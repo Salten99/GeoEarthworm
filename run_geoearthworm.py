@@ -53,7 +53,7 @@ def main(argv=None) -> int:
         help="Interpolation method (default: idw)",
     )
     parser.add_argument("--power", type=float, default=2.0, help="IDW power parameter (default: 2.0)")
-    parser.add_argument("--max-neighbors", type=int, default=None, help="Limit neighbors used per cell (IDW and spline; default: all)")
+    parser.add_argument("--max-neighbors", type=int, default=None, help="Limit neighbors used per cell (IDW and spline; default: all, or the nearest 32 above 1,000 points)")
     parser.add_argument("--max-distance", type=float, default=None, help="Max neighbor distance, in CRS units (IDW only; default: none)")
     parser.add_argument("--smoothing", type=float, default=0.0, help="Smoothing factor for IDW or spline (default: 0.0)")
     parser.add_argument(

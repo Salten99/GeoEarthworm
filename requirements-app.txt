@@ -1,2 +1,2 @@
 -r requirements.txt
-streamlit>=1.30.0
+streamlit>=1.61.0

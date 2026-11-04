@@ -78,8 +78,11 @@ class GeoEarthworm:
             self.dem_transform = dem_transform
             self.dem_crs = CRS.from_epsg(epsg)
 
+        # A degree of longitude is shorter than a degree of latitude, so scale x to keep distances true.
+        self.x_scale = float(np.cos(np.radians(self.lat.mean()))) if CRS.from_epsg(epsg).is_geographic else 1.0
+
         # Interpolation requires a KDTree of values in a 2D array
-        self.points = np.column_stack([self.lon, self.lat])
+        self.points = np.column_stack([self.lon * self.x_scale, self.lat])
         self.tree = cKDTree(self.points)
 
     def IDW(
@@ -108,7 +111,7 @@ class GeoEarthworm:
             np.ndarray: Interpolated values reshaped to match grid_lon/grid_lat shape
         """
 
-        query_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
+        query_points = np.column_stack([grid_lon.ravel() * self.x_scale, grid_lat.ravel()])
         interpolated = np.full(len(query_points), np.nan)
 
         k = len(self.points) if max_neighbors is None else min(max_neighbors, len(self.points))
@@ -141,8 +144,10 @@ class GeoEarthworm:
             if smoothing > 0.0:
                 weights = 1.0 / (distances + smoothing) ** power
             else:
-                safe_distances = np.where(distances == 0, np.nan, distances)
-                weights = np.where(distances == 0, np.inf, 1.0 / (safe_distances ** power))
+                on_point = distances == 0
+                weights = 1.0 / np.where(on_point, 1.0, distances) ** power
+                # A cell exactly on a borehole takes that borehole's value (the mean, if several share the spot).
+                weights = np.where(on_point.any(axis=1, keepdims=True), on_point.astype(float), weights)
 
             weights = np.where(valid_mask, weights, 0.0)
             weight_sum = weights.sum(axis=1, keepdims=True)
@@ -228,8 +233,9 @@ class GeoEarthworm:
         cols = int(np.ceil((max_lon - min_lon) / resolution))
         rows = int(np.ceil((max_lat - min_lat) / resolution))
 
-        x = np.linspace(min_lon, max_lon, cols)
-        y = np.linspace(max_lat, min_lat, rows)  # Reversed for raster (top to bottom)
+        # Pixel centres, so values land where the GeoTIFF's transform says they are.
+        x = min_lon + (np.arange(cols) + 0.5) * (max_lon - min_lon) / cols
+        y = max_lat - (np.arange(rows) + 0.5) * (max_lat - min_lat) / rows  # Reversed for raster (top to bottom)
 
         grid_lon, grid_lat = np.meshgrid(x, y)
 
@@ -507,12 +513,14 @@ class GeoEarthworm:
 
         df = pd.read_csv(filepath, delimiter=delimiter, skiprows=skiprows)
 
-        lon = df[lon_col].values
-        lat = df[lat_col].values
-        bedrock = df[bedrock_col].values
+        # Text such as "unknown" or "<5" counts as missing rather than crashing.
+        lon, lat, bedrock = (
+            pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+            for col in (lon_col, lat_col, bedrock_col)
+        )
 
         # Remove missing values
-        mask = ~(np.isnan(lon) | np.isnan(lat) | np.isnan(bedrock))
+        mask = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(bedrock)
         lon, lat, bedrock = lon[mask], lat[mask], bedrock[mask]
 
         source_crs = CRS.from_epsg(epsg)

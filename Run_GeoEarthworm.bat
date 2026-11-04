@@ -69,6 +69,12 @@ echo Setup complete.
 
 call ".venv\Scripts\activate.bat"
 
+rem Picks up packages added by updates. Quick when nothing changed, and not fatal offline.
+python -m pip install --quiet --disable-pip-version-check -r requirements-app.txt
+if errorlevel 1 (
+    echo Could not check for package updates. Starting anyway...
+)
+
 rem Skip Streamlit's first-run "enter your email" prompt, which otherwise
 rem blocks this window on first launch.
 if not exist "%USERPROFILE%\.streamlit" mkdir "%USERPROFILE%\.streamlit"
