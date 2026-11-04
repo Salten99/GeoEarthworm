@@ -411,11 +411,18 @@ with settings_col:
         can_run = crs is not None and n_valid >= 3
 
     st.header("2. Surface elevation")
-    dem_file = st.file_uploader(
-        "DEM GeoTIFF (optional)", type=["tif", "tiff"],
-        help="A surface elevation raster (GeoTIFF). Needed to compute overburden thickness, "
-             "and to derive bedrock altitude from depth (or vice versa).",
+    dem_choice = st.radio(
+        "Elevation source", ["Find automatically (US only)", "Upload my own", "None"],
+        help="Surface elevation is needed to compute overburden thickness, and to derive bedrock "
+             "altitude from depth (or vice versa).",
     )
+    fetch_dem = dem_choice.startswith("Find")
+    dem_file = None
+    if dem_choice == "Upload my own":
+        dem_file = st.file_uploader("DEM GeoTIFF", type=["tif", "tiff"])
+    elif fetch_dem:
+        st.caption("Downloads USGS 3DEP elevation for your map area when you run. "
+                   "Only the area's coordinates are sent to USGS, not your borehole data.")
 
     st.header("3. Method")
     method_label = st.selectbox(
@@ -473,7 +480,7 @@ with settings_col:
         )
 
     settings = dict(
-        csv=csv_file.name if csv_file else None, dem=dem_file.name if dem_file else None,
+        csv=csv_file.name if csv_file else None, dem=dem_file.name if dem_file else dem_choice,
         lon_col=lon_col if df is not None else None, lat_col=lat_col if df is not None else None,
         value_col=value_col if df is not None else None,
         is_altitude=df is not None and values_kind.startswith("Bedrock altitude"),
@@ -504,7 +511,7 @@ with results_col:
                         csv_path=csv_path, lon_col=settings["lon_col"], lat_col=settings["lat_col"],
                         value_col=settings["value_col"], epsg=settings["epsg"],
                         is_altitude=settings["is_altitude"],
-                        dem_path=str(dem_path) if dem_path else None,
+                        dem_path=str(dem_path) if dem_path else None, fetch_dem=fetch_dem,
                         buffer_frac=buffer, resolution=resolution, method=method, power=power,
                         max_neighbors=settings["max_neighbors"] or None, smoothing=smoothing,
                         variogram_model=variogram_model, output_dir=tmp_dir / "output",
@@ -556,6 +563,7 @@ with results_col:
                         f"{result.input_stats['count']} boreholes interpolated onto a "
                         f"{grid_shape[1]} × {grid_shape[0]} grid "
                         f"(cell size {cell:.4g} {'°' if CRS.from_epsg(settings['epsg']).is_geographic else 'units'})."
+                        + (f" Surface elevation from {result.dem_source}." if result.dem_source else "")
                     ),
                     "overlay": overlay,
                     "points": pts,

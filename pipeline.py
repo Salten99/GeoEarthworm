@@ -9,8 +9,11 @@ overburden-thickness GeoTIFFs plus a summary PNG. Shared by the CLI
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -18,11 +21,14 @@ import matplotlib.pyplot as plt
 import rasterio as rio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
-from rasterio.warp import reproject, Resampling
+from rasterio.warp import reproject, Resampling, transform_bounds
 
 from geo_earthworm import GeoEarthworm
 
 PathLike = Union[str, Path]
+
+USGS_3DEP_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+USGS_MAX_PIXELS = 8000  # the service's maxImageWidth/maxImageHeight
 
 # Depth: one-hue-family ramp, light = shallow, dark = deep. Altitude keeps the conventional terrain ramp.
 PRIMARY_CMAPS = {
@@ -50,6 +56,7 @@ class PipelineResult:
     bedrock_altitude_stats: Optional[dict] = None
     overburden_stats: Optional[dict] = None
     warnings: list = field(default_factory=list)
+    dem_source: Optional[str] = None
 
 
 def _auto_bbox(lon: np.ndarray, lat: np.ndarray, buffer_frac: float) -> Tuple[float, float, float, float]:
@@ -166,6 +173,32 @@ def _resample_to_grid(src_path: str, ref_path: str) -> np.ndarray:
     return out
 
 
+def fetch_usgs_dem(bbox: Tuple[float, float, float, float], epsg: int, shape: Tuple[int, int],
+                   out_path: Path, timeout: int = 60) -> float:
+    """Download USGS 3DEP elevation (metres) covering bbox. Returns the share of pixels with data."""
+    west, south, east, north = transform_bounds(CRS.from_epsg(epsg), CRS.from_epsg(4326), *bbox, densify_pts=21)
+    # A small margin so bilinear resampling has data right up to the map edge.
+    pad_x, pad_y = (east - west) * 0.02, (north - south) * 0.02
+    west, south, east, north = west - pad_x, south - pad_y, east + pad_x, north + pad_y
+
+    long_side = min(max(shape), USGS_MAX_PIXELS)
+    wide = (east - west) * np.cos(np.radians((south + north) / 2))
+    tall = north - south
+    width = max(2, round(long_side * min(1, wide / tall)))
+    height = max(2, round(long_side * min(1, tall / wide)))
+
+    query = urlencode({
+        "bbox": f"{west},{south},{east},{north}", "bboxSR": 4326, "imageSR": 4326,
+        "size": f"{width},{height}", "format": "tiff", "pixelType": "F32", "noData": -9999,
+        "interpolation": "RSP_BilinearInterpolation", "f": "image",
+    })
+    with urlopen(f"{USGS_3DEP_URL}?{query}", timeout=timeout) as response:
+        out_path.write_bytes(response.read())
+    # The service reports errors as JSON with a 200 and a TIFF content type, so rio.open is the real check.
+    with rio.open(out_path) as src:
+        return src.read(1, masked=True).count() / (src.width * src.height)
+
+
 def _write_geotiff(path: Path, array: np.ndarray, transform, epsg: int, nodata: float) -> None:
     out = np.where(np.isnan(array), nodata, array)
     with rio.open(
@@ -255,10 +288,12 @@ def run(
     dpi: int = 200,
     show_points: bool = True,
     on_step: Optional[Callable[[str], None]] = None,
+    fetch_dem: bool = False,
 ) -> PipelineResult:
     """Run the full borehole -> bedrock level (+ overburden) -> image pipeline.
 
     on_step, if given, is called with a short description as each stage starts.
+    fetch_dem downloads a USGS DEM for the map area when dem_path isn't given (US coverage only).
     """
     step = on_step or (lambda _msg: None)
 
@@ -329,6 +364,28 @@ def run(
     else:
         depth_path, depth_grid = native_path, native_grid
 
+    dem_source = None
+    if dem_path is not None:
+        dem_source = "your uploaded DEM"
+    elif fetch_dem:
+        step("Downloading surface elevation from USGS")
+        usgs_path = output_dir / "usgs_dem.tif"
+        no_overburden = "Overburden thickness was not computed; upload your own DEM to include it."
+        try:
+            coverage = fetch_usgs_dem(bbox, epsg, native_grid.shape, usgs_path)
+        except (OSError, HTTPException, ValueError) as e:
+            warnings_out.append(f"Couldn't get elevation data from USGS ({e}). {no_overburden}")
+        else:
+            if coverage == 0:
+                warnings_out.append(f"USGS has no elevation data for this area (it covers the US). {no_overburden}")
+            else:
+                dem_path, dem_source = usgs_path, "USGS 3DEP"
+                if coverage < 0.99:
+                    warnings_out.append(
+                        f"USGS elevation data covers only {coverage:.0%} of this map, so surface-based "
+                        "results are blank elsewhere."
+                    )
+
     if dem_path is not None:
         step("Combining with the surface elevation model")
         # Derive whichever of depth/altitude is missing by resampling the DEM
@@ -360,10 +417,11 @@ def run(
         else:
             depth_stats = native_stats
         kind = "bedrock altitude" if is_altitude else "bedrock depth"
-        warnings_out.append(
-            f"No DEM supplied: overburden thickness was not computed, and only the native "
-            f"{kind} raster was produced."
-        )
+        if not fetch_dem:  # a failed download has already explained itself
+            warnings_out.append(
+                f"No DEM supplied: overburden thickness was not computed, and only the native "
+                f"{kind} raster was produced."
+            )
 
     # Plot the quantity the boreholes measured, so the dots and the grid share one colour scale.
     if is_altitude:
@@ -392,4 +450,5 @@ def run(
         bedrock_altitude_stats=altitude_stats,
         overburden_stats=overburden_stats,
         warnings=warnings_out,
+        dem_source=dem_source,
     )

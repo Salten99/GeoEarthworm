@@ -179,8 +179,9 @@ etc.). Outputs default to `geoearthworm_output/`.
 
 ## Web App
 
-`app.py` is a Streamlit UI over the same pipeline — upload a CSV (and
-optional DEM) in the browser and download the resulting rasters and image.
+`app.py` is a Streamlit UI over the same pipeline — upload a CSV in the browser
+and download the resulting rasters and image. For US sites it can download
+surface elevation from USGS 3DEP for the map area; you can also upload your own DEM.
 
 ```bash
 pip install -r requirements-app.txt
