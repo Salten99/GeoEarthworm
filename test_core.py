@@ -119,4 +119,40 @@ with tempfile.TemporaryDirectory() as folder:
         r = pipeline.run(good, method=method, output_dir=tmp / method, dpi=50)
         assert 0 < r.bedrock_depth_stats["mean"] < 60, (method, r.bedrock_depth_stats)
 
+# A zero margin keeps the map tight; the 1-unit pad is only for boreholes with no width.
+assert pipeline._auto_bbox(np.array([0.0, 2.0]), np.array([0.0, 1.0]), 0.0) == (0, 0, 2, 1)
+assert pipeline._auto_bbox(np.array([0.0, 2.0]), np.array([5.0, 5.0]), 0.1) == (-0.2, 4, 2.2, 6)
+
+with tempfile.TemporaryDirectory() as folder:
+    tmp = Path(folder)
+    rows = [(-71.5 + .1 * i, 41.5 + .07 * ((i * 3) % 5), 10 + 3.0 * i) for i in range(12)]
+
+    # A location measured twice is averaged, so spline and kriging can still solve.
+    dup = tmp / "dup.csv"
+    pd.DataFrame([*rows, (rows[0][0], rows[0][1], rows[0][2] + 2)],
+                 columns=("longitude", "latitude", "bedrock_depth")).to_csv(dup, index=False)
+    for method in ("idw", "kriging", "spline"):
+        r = pipeline.run(dup, method=method, output_dir=tmp / f"dup_{method}", dpi=50)
+        assert r.input_stats["count"] == 12 and any("Averaged 1" in w for w in r.warnings), r.warnings
+
+    # Kriging in row bands gives the same surface as all at once, without the memory spike.
+    lon, lat, val = (np.array(c) for c in zip(*rows))
+    gx, gy, _ = pipeline._build_grid((-72, 41, -70, 43), 0.05)
+    whole = pipeline._interpolate_kriging(lon, lat, val, gx, gy, "spherical")
+    real, pipeline.KRIGING_CELLS_X_POINTS = pipeline.KRIGING_CELLS_X_POINTS, 50 * 12  # 1 row per band
+    banded = pipeline._interpolate_kriging(lon, lat, val, gx, gy, "spherical")
+    pipeline.KRIGING_CELLS_X_POINTS = real
+    assert np.allclose(whole, banded), np.nanmax(np.abs(whole - banded))
+
+    import tracemalloc
+    rng = np.random.default_rng(2)
+    big = tmp / "big.csv"
+    pd.DataFrame({"longitude": rng.uniform(-72, -71, 500), "latitude": rng.uniform(41, 42, 500),
+                  "bedrock_depth": rng.uniform(1, 50, 500)}).to_csv(big, index=False)
+    tracemalloc.start()
+    pipeline.run(big, method="kriging", output_dir=tmp / "big", dpi=50)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 0.5e9, f"kriging peaked at {peak / 1e9:.2f} GB"  # was ~1.95 GB before banding
+
 print("all core checks passed")

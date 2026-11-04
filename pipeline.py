@@ -38,6 +38,7 @@ AUTO_NEIGHBORS_ABOVE = 1000
 # Only with server_limits: one request must not take down a small shared server.
 SERVER_MAX_CELLS = 4_000_000
 SERVER_MAX_KRIGING_POINTS = 2000
+KRIGING_CELLS_X_POINTS = 2_000_000
 
 # Values DEMs often use for gaps without declaring them as NoData.
 UNDECLARED_DEM_GAPS = (-9999, -32768)
@@ -74,8 +75,9 @@ class PipelineResult:
 def _auto_bbox(lon: np.ndarray, lat: np.ndarray, buffer_frac: float) -> Tuple[float, float, float, float]:
     lon_min, lon_max = float(lon.min()), float(lon.max())
     lat_min, lat_max = float(lat.min()), float(lat.max())
-    lon_pad = (lon_max - lon_min) * buffer_frac or 1.0
-    lat_pad = (lat_max - lat_min) * buffer_frac or 1.0
+    # The 1-unit pad is only for boreholes in a line (no width); a zero margin must stay zero.
+    lon_pad = (lon_max - lon_min) * buffer_frac if lon_max > lon_min else 1.0
+    lat_pad = (lat_max - lat_min) * buffer_frac if lat_max > lat_min else 1.0
     return (lon_min - lon_pad, lat_min - lat_pad, lon_max + lon_pad, lat_max + lat_pad)
 
 
@@ -124,7 +126,9 @@ def _interpolate_kriging(
     )
     x = grid_lon[0, :]
     y = grid_lat[:, 0]
-    z, _ = ok.execute("grid", x, y)
+    # PyKrige builds a cells x boreholes matrix; a band of rows at a time keeps that near 16 MB.
+    rows = max(1, KRIGING_CELLS_X_POINTS // (len(x) * len(lon)))
+    z = np.vstack([ok.execute("grid", x, y[i:i + rows])[0] for i in range(0, len(y), rows)])
     return np.asarray(z, dtype=np.float64)
 
 
@@ -372,6 +376,14 @@ def run(
     skipped = len(pd.read_csv(csv_path, usecols=[value_col])) - len(lon)
     if skipped:
         warnings_out.append(f"Skipped {skipped:,} row(s) with a missing or non-numeric position or bedrock value.")
+
+    # Repeat measurements at one spot make spline (and kriging) unsolvable, so use their mean.
+    unique = pd.DataFrame({"x": lon, "y": lat, "v": values}).groupby(["x", "y"], as_index=False)["v"].mean()
+    if len(unique) < len(lon):
+        warnings_out.append(
+            f"Averaged {len(lon) - len(unique):,} repeated measurement(s) at locations that appear more than once."
+        )
+        lon, lat, values = (unique[c].to_numpy() for c in ("x", "y", "v"))
 
     if len(lon) < 3:
         raise ValueError(
